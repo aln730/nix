@@ -3,7 +3,7 @@ project(
   'cpp',
   version : files('.version'),
   default_options : [
-    'cpp_std=c++2a',
+    'cpp_std=c++23',
     # TODO(Qyriad): increase the warning level
     'warning_level=1',
     'errorlogs=true', # Please print logs for tests that fail
@@ -55,6 +55,7 @@ sources = files(
   'nix_api_expr.cc',
   'nix_api_external.cc',
   'nix_api_value.cc',
+  'nix_api_value_internal.cc',
   'primops.cc',
   'search-path.cc',
   'trivial.cc',
@@ -75,6 +76,7 @@ this_exe = executable(
   # TODO: -lrapidcheck, see ../libutil-support/build.meson
   link_args : linker_export_flags + [ '-lrapidcheck' ],
   install : true,
+  cpp_pch : do_pch ? [ 'pch/precompiled-headers.hh' ] : [],
 )
 
 test(

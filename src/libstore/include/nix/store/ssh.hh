@@ -1,12 +1,15 @@
 #pragma once
 ///@file
 
+#include "nix/util/ref.hh"
 #include "nix/util/sync.hh"
 #include "nix/util/url.hh"
 #include "nix/util/processes.hh"
 #include "nix/util/file-system.hh"
 
 namespace nix {
+
+Strings getNixSshOpts();
 
 class SSHMaster
 {
@@ -24,12 +27,13 @@ private:
     const bool compress;
     const Descriptor logFD;
 
+    const ref<const AutoDelete> tmpDir;
+
     struct State
     {
 #ifndef _WIN32 // TODO re-enable on Windows, once we can start processes.
         Pid sshMaster;
 #endif
-        std::unique_ptr<AutoDelete> tmpDir;
         Path socketPath;
     };
 

@@ -16,6 +16,7 @@
 #include "nix/store/posix-fs-canonicalise.hh"
 #include "nix/util/posix-source-accessor.hh"
 #include "nix/store/keys.hh"
+#include "nix/util/url.hh"
 #include "nix/util/users.hh"
 #include "nix/store/store-open.hh"
 #include "nix/store/store-registration.hh"
@@ -85,6 +86,11 @@ ref<Store> LocalStore::Config::openStore() const
     return make_ref<LocalStore>(ref{shared_from_this()});
 }
 
+bool LocalStoreConfig::getDefaultRequireSigs()
+{
+    return settings.requireSigs;
+}
+
 struct LocalStore::State::Stmts
 {
     /* Some precompiled SQLite statements. */
@@ -112,6 +118,7 @@ LocalStore::LocalStore(ref<const Config> config)
     : Store{*config}
     , LocalFSStore{*config}
     , config{config}
+    , _state(make_ref<Sync<State>>())
     , dbDir(config->stateDir + "/db")
     , linksDir(config->realStoreDir + "/.links")
     , reservedPath(dbDir + "/reserved")
@@ -119,7 +126,7 @@ LocalStore::LocalStore(ref<const Config> config)
     , tempRootsDir(config->stateDir + "/temproots")
     , fnTempRoots(fmt("%s/%d", tempRootsDir, getpid()))
 {
-    auto state(_state.lock());
+    auto state(_state->lock());
     state->stmts = std::make_unique<State::Stmts>();
 
     /* Create missing state directories if they don't already exist. */
@@ -227,7 +234,17 @@ LocalStore::LocalStore(ref<const Config> config)
        schema upgrade is in progress. */
     if (!config->readOnly) {
         Path globalLockPath = dbDir + "/big-lock";
-        globalLock = openLockFile(globalLockPath.c_str(), true);
+        try {
+            globalLock = openLockFile(globalLockPath.c_str(), true);
+        } catch (SysError & e) {
+            if (e.errNo == EACCES || e.errNo == EPERM) {
+                e.addTrace(
+                    {},
+                    "This command may have been run as non-root in a single-user Nix installation,\n"
+                    "or the Nix daemon may have crashed.");
+            }
+            throw;
+        }
     }
 
     if (!config->readOnly && !lockFile(globalLock.get(), ltRead, false)) {
@@ -417,7 +434,7 @@ LocalStore::~LocalStore()
     std::shared_future<void> future;
 
     {
-        auto state(_state.lock());
+        auto state(_state->lock());
         if (state->gcRunning)
             future = state->gcFuture;
     }
@@ -438,9 +455,20 @@ LocalStore::~LocalStore()
     }
 }
 
-std::string LocalStore::getUri()
+StoreReference LocalStoreConfig::getReference() const
 {
-    return "local";
+    auto params = getQueryParams();
+    /* Back-compatibility kludge. Tools like nix-output-monitor expect 'local'
+       and can't parse 'local://'. */
+    if (params.empty())
+        return {.variant = StoreReference::Local{}};
+    return {
+        .variant =
+            StoreReference::Specified{
+                .scheme = *uriSchemes().begin(),
+            },
+        .params = std::move(params),
+    };
 }
 
 int LocalStore::getSchema()
@@ -466,12 +494,11 @@ void LocalStore::openDB(State & state, bool create)
         throw SysError("Nix database directory '%1%' is not writable", dbDir);
 
     /* Open the Nix database. */
-    std::string dbPath = dbDir + "/db.sqlite";
     auto & db(state.db);
     auto openMode = config->readOnly ? SQLiteOpenMode::Immutable
                     : create         ? SQLiteOpenMode::Normal
                                      : SQLiteOpenMode::NoCreate;
-    state.db = SQLite(dbPath, openMode);
+    state.db = SQLite(std::filesystem::path(dbDir) / "db.sqlite", openMode);
 
 #ifdef __CYGWIN__
     /* The cygwin version of sqlite3 has a patch which calls
@@ -603,7 +630,7 @@ void LocalStore::registerDrvOutput(const Realisation & info)
 {
     experimentalFeatureSettings.require(Xp::CaDerivations);
     retrySQLite<void>([&]() {
-        auto state(_state.lock());
+        auto state(_state->lock());
         if (auto oldR = queryRealisation_(*state, info.id)) {
             if (info.isCompatibleWith(*oldR)) {
                 auto combinedSignatures = oldR->signatures;
@@ -695,12 +722,8 @@ uint64_t LocalStore::addValidPath(State & state, const ValidPathInfo & info, boo
         }
     }
 
-    {
-        auto state_(Store::state.lock());
-        state_->pathInfoCache.upsert(
-            std::string(info.path.to_string()),
-            PathInfoCacheValue{.value = std::make_shared<const ValidPathInfo>(info)});
-    }
+    pathInfoCache->lock()->upsert(
+        std::string(info.path.to_string()), PathInfoCacheValue{.value = std::make_shared<const ValidPathInfo>(info)});
 
     return id;
 }
@@ -710,8 +733,7 @@ void LocalStore::queryPathInfoUncached(
 {
     try {
         callback(retrySQLite<std::shared_ptr<const ValidPathInfo>>([&]() {
-            auto state(_state.lock());
-            return queryPathInfoInternal(*state, path);
+            return queryPathInfoInternal(*_state->lock(), path);
         }));
 
     } catch (...) {
@@ -793,10 +815,7 @@ bool LocalStore::isValidPath_(State & state, const StorePath & path)
 
 bool LocalStore::isValidPathUncached(const StorePath & path)
 {
-    return retrySQLite<bool>([&]() {
-        auto state(_state.lock());
-        return isValidPath_(*state, path);
-    });
+    return retrySQLite<bool>([&]() { return isValidPath_(*_state->lock(), path); });
 }
 
 StorePathSet LocalStore::queryValidPaths(const StorePathSet & paths, SubstituteFlag maybeSubstitute)
@@ -811,7 +830,7 @@ StorePathSet LocalStore::queryValidPaths(const StorePathSet & paths, SubstituteF
 StorePathSet LocalStore::queryAllValidPaths()
 {
     return retrySQLite<StorePathSet>([&]() {
-        auto state(_state.lock());
+        auto state(_state->lock());
         auto use(state->stmts->QueryValidPaths.use());
         StorePathSet res;
         while (use.next())
@@ -830,16 +849,13 @@ void LocalStore::queryReferrers(State & state, const StorePath & path, StorePath
 
 void LocalStore::queryReferrers(const StorePath & path, StorePathSet & referrers)
 {
-    return retrySQLite<void>([&]() {
-        auto state(_state.lock());
-        queryReferrers(*state, path, referrers);
-    });
+    return retrySQLite<void>([&]() { queryReferrers(*_state->lock(), path, referrers); });
 }
 
 StorePathSet LocalStore::queryValidDerivers(const StorePath & path)
 {
     return retrySQLite<StorePathSet>([&]() {
-        auto state(_state.lock());
+        auto state(_state->lock());
 
         auto useQueryValidDerivers(state->stmts->QueryValidDerivers.use()(printStorePath(path)));
 
@@ -855,7 +871,7 @@ std::map<std::string, std::optional<StorePath>>
 LocalStore::queryStaticPartialDerivationOutputMap(const StorePath & path)
 {
     return retrySQLite<std::map<std::string, std::optional<StorePath>>>([&]() {
-        auto state(_state.lock());
+        auto state(_state->lock());
         std::map<std::string, std::optional<StorePath>> outputs;
         uint64_t drvId;
         drvId = queryValidPathId(*state, path);
@@ -875,7 +891,7 @@ std::optional<StorePath> LocalStore::queryPathFromHashPart(const std::string & h
     Path prefix = storeDir + "/" + hashPart;
 
     return retrySQLite<std::optional<StorePath>>([&]() -> std::optional<StorePath> {
-        auto state(_state.lock());
+        auto state(_state->lock());
 
         auto useQueryPathFromHashPart(state->stmts->QueryPathFromHashPart.use()(prefix));
 
@@ -940,7 +956,7 @@ void LocalStore::registerValidPaths(const ValidPathInfos & infos)
 #endif
 
     return retrySQLite<void>([&]() {
-        auto state(_state.lock());
+        auto state(_state->lock());
 
         SQLiteTxn txn(state->db);
         StorePathSet paths;
@@ -973,16 +989,22 @@ void LocalStore::registerValidPaths(const ValidPathInfos & infos)
            error if a cycle is detected and roll back the
            transaction.  Cycles can only occur when a derivation
            has multiple outputs. */
-        topoSort(
-            paths,
-            {[&](const StorePath & path) {
-                auto i = infos.find(path);
-                return i == infos.end() ? StorePathSet() : i->second.references;
-            }},
-            {[&](const StorePath & path, const StorePath & parent) {
-                return BuildError(
-                    "cycle detected in the references of '%s' from '%s'", printStorePath(path), printStorePath(parent));
-            }});
+        auto topoSortResult = topoSort(paths, {[&](const StorePath & path) {
+                                           auto i = infos.find(path);
+                                           return i == infos.end() ? StorePathSet() : i->second.references;
+                                       }});
+
+        std::visit(
+            overloaded{
+                [&](const Cycle<StorePath> & cycle) {
+                    throw BuildError(
+                        BuildResult::Failure::OutputRejected,
+                        "cycle detected in the references of '%s' from '%s'",
+                        printStorePath(cycle.path),
+                        printStorePath(cycle.parent));
+                },
+                [](auto &) { /* Success, continue */ }},
+            topoSortResult);
 
         txn.commit();
     });
@@ -999,15 +1021,12 @@ void LocalStore::invalidatePath(State & state, const StorePath & path)
     /* Note that the foreign key constraints on the Refs table take
        care of deleting the references entries for `path'. */
 
-    {
-        auto state_(Store::state.lock());
-        state_->pathInfoCache.erase(std::string(path.to_string()));
-    }
+    pathInfoCache->lock()->erase(std::string(path.to_string()));
 }
 
 const PublicKeys & LocalStore::getPublicKeys()
 {
-    auto state(_state.lock());
+    auto state(_state->lock());
     if (!state->publicKeys)
         state->publicKeys = std::make_unique<PublicKeys>(getDefaultPublicKeys());
     return *state->publicKeys;
@@ -1020,7 +1039,7 @@ bool LocalStore::pathInfoIsUntrusted(const ValidPathInfo & info)
 
 bool LocalStore::realisationIsUntrusted(const Realisation & realisation)
 {
-    return config->requireSigs && !realisation.checkSignatures(getPublicKeys());
+    return config->requireSigs && !realisation.checkSignatures(realisation.id, getPublicKeys());
 }
 
 void LocalStore::addToStore(const ValidPathInfo & info, Source & source, RepairFlag repair, CheckSigsFlag checkSigs)
@@ -1032,15 +1051,13 @@ void LocalStore::addToStore(const ValidPathInfo & info, Source & source, RepairF
         /* In case we are not interested in reading the NAR: discard it. */
         bool narRead = false;
         Finally cleanup = [&]() {
-            if (!narRead) {
-                NullFileSystemObjectSink sink;
+            if (!narRead)
                 try {
-                    parseDump(sink, source);
+                    source.skip(info.narSize);
                 } catch (...) {
                     // TODO: should Interrupted be handled here?
                     ignoreExceptionInDestructor();
                 }
-            }
         };
 
         addTempRoot(info.path);
@@ -1049,7 +1066,7 @@ void LocalStore::addToStore(const ValidPathInfo & info, Source & source, RepairF
 
             PathLocks outputLock;
 
-            auto realPath = Store::toRealPath(info.path);
+            auto realPath = toRealPath(info.path);
 
             /* Lock the output path.  But don't lock if we're being called
             from a build hook (whose parent process already acquired a
@@ -1248,7 +1265,7 @@ StorePath LocalStore::addToStoreFromDump(
         /* The first check above is an optimisation to prevent
            unnecessary lock acquisition. */
 
-        auto realPath = Store::toRealPath(dstPath);
+        auto realPath = toRealPath(dstPath);
 
         PathLocks outputLock({realPath});
 
@@ -1295,7 +1312,7 @@ StorePath LocalStore::addToStoreFromDump(
                 syncParent(realPath);
             }
 
-            ValidPathInfo info{*this, name, std::move(desc), narHash.hash};
+            auto info = ValidPathInfo::makeFromCA(*this, name, std::move(desc), narHash.hash);
             info.narSize = narHash.numBytesDigested;
             registerValidPath(info);
         }
@@ -1330,7 +1347,7 @@ std::pair<std::filesystem::path, AutoCloseFD> LocalStore::createTempDirInStore()
 void LocalStore::invalidatePathChecked(const StorePath & path)
 {
     retrySQLite<void>([&]() {
-        auto state(_state.lock());
+        auto state(_state->lock());
 
         SQLiteTxn txn(state->db);
 
@@ -1367,7 +1384,7 @@ bool LocalStore::verifyStore(bool checkContents, RepairFlag repair)
         for (auto & link : DirectoryIterator{linksDir}) {
             checkInterrupt();
             auto name = link.path().filename();
-            printMsg(lvlTalkative, "checking contents of '%s'", name);
+            printMsg(lvlTalkative, "checking contents of %s", name);
             PosixSourceAccessor accessor;
             std::string hash = hashPath(
                                    PosixSourceAccessor::createAtRoot(link.path()),
@@ -1375,10 +1392,10 @@ bool LocalStore::verifyStore(bool checkContents, RepairFlag repair)
                                    HashAlgorithm::SHA256)
                                    .first.to_string(HashFormat::Nix32, false);
             if (hash != name.string()) {
-                printError("link '%s' was modified! expected hash '%s', got '%s'", link.path(), name, hash);
+                printError("link %s was modified! expected hash %s, got '%s'", link.path(), name, hash);
                 if (repair) {
                     std::filesystem::remove(link.path());
-                    printInfo("removed link '%s'", link.path());
+                    printInfo("removed link %s", link.path());
                 } else {
                     errors = true;
                 }
@@ -1399,7 +1416,7 @@ bool LocalStore::verifyStore(bool checkContents, RepairFlag repair)
 
                 auto hashSink = HashSink(info->narHash.algo);
 
-                dumpPath(Store::toRealPath(i), hashSink);
+                dumpPath(toRealPath(i), hashSink);
                 auto current = hashSink.finish();
 
                 if (info->narHash != nullHash && info->narHash != current.hash) {
@@ -1430,10 +1447,8 @@ bool LocalStore::verifyStore(bool checkContents, RepairFlag repair)
                         update = true;
                     }
 
-                    if (update) {
-                        auto state(_state.lock());
-                        updatePathInfo(*state, *info);
-                    }
+                    if (update)
+                        updatePathInfo(*_state->lock(), *info);
                 }
 
             } catch (Error & e) {
@@ -1520,8 +1535,7 @@ void LocalStore::verifyPath(
 
         if (canInvalidate) {
             printInfo("path '%s' disappeared, removing from database...", pathS);
-            auto state(_state.lock());
-            invalidatePath(*state, path);
+            invalidatePath(*_state->lock(), path);
         } else {
             printError("path '%s' disappeared, but it still has valid referrers!", pathS);
             if (repair)
@@ -1553,14 +1567,13 @@ std::optional<TrustedFlag> LocalStore::isTrustedClient()
 
 void LocalStore::vacuumDB()
 {
-    auto state(_state.lock());
-    state->db.exec("vacuum");
+    _state->lock()->db.exec("vacuum");
 }
 
 void LocalStore::addSignatures(const StorePath & storePath, const StringSet & sigs)
 {
     retrySQLite<void>([&]() {
-        auto state(_state.lock());
+        auto state(_state->lock());
 
         SQLiteTxn txn(state->db);
 
@@ -1574,7 +1587,7 @@ void LocalStore::addSignatures(const StorePath & storePath, const StringSet & si
     });
 }
 
-std::optional<std::pair<int64_t, Realisation>>
+std::optional<std::pair<int64_t, UnkeyedRealisation>>
 LocalStore::queryRealisationCore_(LocalStore::State & state, const DrvOutput & id)
 {
     auto useQueryRealisedOutput(state.stmts->QueryRealisedOutput.use()(id.strHash())(id.outputName));
@@ -1586,14 +1599,13 @@ LocalStore::queryRealisationCore_(LocalStore::State & state, const DrvOutput & i
 
     return {
         {realisationDbId,
-         Realisation{
-             .id = id,
+         UnkeyedRealisation{
              .outPath = outputPath,
              .signatures = signatures,
          }}};
 }
 
-std::optional<const Realisation> LocalStore::queryRealisation_(LocalStore::State & state, const DrvOutput & id)
+std::optional<const UnkeyedRealisation> LocalStore::queryRealisation_(LocalStore::State & state, const DrvOutput & id)
 {
     auto maybeCore = queryRealisationCore_(state, id);
     if (!maybeCore)
@@ -1619,15 +1631,13 @@ std::optional<const Realisation> LocalStore::queryRealisation_(LocalStore::State
 }
 
 void LocalStore::queryRealisationUncached(
-    const DrvOutput & id, Callback<std::shared_ptr<const Realisation>> callback) noexcept
+    const DrvOutput & id, Callback<std::shared_ptr<const UnkeyedRealisation>> callback) noexcept
 {
     try {
-        auto maybeRealisation = retrySQLite<std::optional<const Realisation>>([&]() {
-            auto state(_state.lock());
-            return queryRealisation_(*state, id);
-        });
+        auto maybeRealisation = retrySQLite<std::optional<const UnkeyedRealisation>>(
+            [&]() { return queryRealisation_(*_state->lock(), id); });
         if (maybeRealisation)
-            callback(std::make_shared<const Realisation>(maybeRealisation.value()));
+            callback(std::make_shared<const UnkeyedRealisation>(maybeRealisation.value()));
         else
             callback(nullptr);
 

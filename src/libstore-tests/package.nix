@@ -42,21 +42,16 @@ mkMesonExecutable (finalAttrs: {
     (fileset.fileFilter (file: file.hasExt "hh") ./.)
   ];
 
-  # Hack for sake of the dev shell
-  passthru.externalBuildInputs =
-    [
-      sqlite
-      rapidcheck
-      gtest
-    ]
-    ++ lib.optionals withBenchmarks [
-      gbenchmark
-    ];
-
-  buildInputs = finalAttrs.passthru.externalBuildInputs ++ [
+  buildInputs = [
+    sqlite
+    rapidcheck
+    gtest
     nix-store
     nix-store-c
     nix-store-test-support
+  ]
+  ++ lib.optionals withBenchmarks [
+    gbenchmark
   ];
 
   mesonFlags = [

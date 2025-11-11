@@ -2,7 +2,7 @@ project(
   'nix-functional-tests',
   version : files('.version'),
   default_options : [
-    'cpp_std=c++2a',
+    'cpp_std=c++23',
     # TODO(Qyriad): increase the warning level
     'warning_level=1',
     'errorlogs=true', # Please print logs for tests that fail
@@ -174,6 +174,7 @@ suites = [
       'extra-sandbox-profile.sh',
       'help.sh',
       'symlinks.sh',
+      'external-builders.sh',
     ],
     'workdir' : meson.current_source_dir(),
   },
@@ -223,10 +224,28 @@ subdir('local-overlay-store')
 foreach suite : suites
   workdir = suite['workdir']
   suite_name = suite['name']
+  # This is workaround until [1] is resolved. When building in a devshell
+  # as a subproject we want the tests to depend on the nix build target, so
+  # that it gets automatically rebuilt.
+  # However, when the functional test suite is built separately (via componentized
+  # builds or in NixOS tests) we can't depend on the nix executable, since it's
+  # an external program. The following is a simple heuristic that suffices for now.
+  # [1]: https://github.com/mesonbuild/meson/issues/13877
+  deps = suite['deps']
+  if meson.is_subproject()
+    nix_subproject = subproject('nix')
+    deps += [ nix ] + nix_subproject.get_variable('nix_symlinks_targets')
+  endif
   foreach script : suite['tests']
     # Turns, e.g., `tests/functional/flakes/show.sh` into a Meson test target called
     # `functional-flakes-show`.
     name = fs.replace_suffix(script, '')
+    asan_options = 'abort_on_error=1:print_summary=1:detect_leaks=0'
+    # Otherwise ASAN dumps warnings into stderr that make some tests fail on stderr output
+    # comparisons.
+    asan_options += ':log_path=@0@'.format(
+      meson.current_build_dir() / 'asan-log',
+    )
 
     test(
       name,
@@ -241,9 +260,11 @@ foreach suite : suites
       ],
       suite : suite_name,
       env : {
+        'ASAN_OPTIONS' : asan_options,
         '_NIX_TEST_SOURCE_DIR' : meson.current_source_dir(),
         '_NIX_TEST_BUILD_DIR' : meson.current_build_dir(),
-        'TEST_NAME' : suite_name / name,
+        'TEST_SUITE_NAME' : suite_name,
+        'TEST_NAME' : name,
         'NIX_REMOTE' : '',
         'PS4' : '+(${BASH_SOURCE[0]-$0}:$LINENO) ',
       },
@@ -252,7 +273,7 @@ foreach suite : suites
       # them more time than the default of 30 seconds.
       timeout : 300,
       # Used for target dependency/ordering tracking, not adding compiler flags or anything.
-      depends : suite['deps'],
+      depends : deps,
       workdir : workdir,
     )
   endforeach

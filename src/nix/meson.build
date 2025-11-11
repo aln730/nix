@@ -3,7 +3,7 @@ project(
   'cpp',
   version : files('.version'),
   default_options : [
-    'cpp_std=c++2a',
+    'cpp_std=c++23',
     # TODO(Qyriad): increase the warning level
     'warning_level=1',
     'errorlogs=true', # Please print logs for tests that fail
@@ -77,6 +77,7 @@ nix_sources = [ config_priv_h ] + files(
   'edit.cc',
   'env.cc',
   'eval.cc',
+  'flake-prefetch-inputs.cc',
   'flake.cc',
   'formatter.cc',
   'hash.cc',
@@ -211,6 +212,7 @@ if host_machine.system() == 'windows'
   executable_suffix = '.exe'
 endif
 
+nix_symlinks_targets = []
 foreach linkname : nix_symlinks
   install_symlink(
     linkname + executable_suffix,
@@ -220,7 +222,7 @@ foreach linkname : nix_symlinks
     # The 'runtime' tag is what executables default to, which we want to emulate here.
     install_tag : 'runtime',
   )
-  custom_target(
+  symlink_target = custom_target(
     command : [ 'ln', '-sf', fs.name(this_exe), '@OUTPUT@' ],
     output : linkname + executable_suffix,
     # native doesn't allow dangling symlinks, but the target executable often doesn't exist at this time
@@ -230,6 +232,7 @@ foreach linkname : nix_symlinks
   )
   # TODO(Ericson3214): Doesn't yet work
   #meson.override_find_program(linkname, t)
+  nix_symlinks_targets += symlink_target
 endforeach
 
 install_symlink(

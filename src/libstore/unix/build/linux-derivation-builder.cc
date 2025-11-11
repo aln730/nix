@@ -3,6 +3,7 @@
 #  include "nix/store/personality.hh"
 #  include "nix/util/cgroup.hh"
 #  include "nix/util/linux-namespaces.hh"
+#  include "nix/util/logging.hh"
 #  include "linux/fchmodat2-compat.hh"
 
 #  include <sys/ioctl.h>
@@ -191,7 +192,7 @@ struct ChrootLinuxDerivationBuilder : ChrootDerivationBuilder, LinuxDerivationBu
     std::optional<Path> cgroup;
 
     ChrootLinuxDerivationBuilder(
-        Store & store, std::unique_ptr<DerivationBuilderCallbacks> miscMethods, DerivationBuilderParams params)
+        LocalStore & store, std::unique_ptr<DerivationBuilderCallbacks> miscMethods, DerivationBuilderParams params)
         : DerivationBuilderImpl{store, std::move(miscMethods), std::move(params)}
         , ChrootDerivationBuilder{store, std::move(miscMethods), std::move(params)}
         , LinuxDerivationBuilder{store, std::move(miscMethods), std::move(params)}
@@ -275,6 +276,12 @@ struct ChrootLinuxDerivationBuilder : ChrootDerivationBuilder, LinuxDerivationBu
 
     void startChild() override
     {
+        RunChildArgs args{
+#  if NIX_WITH_AWS_AUTH
+            .awsCredentials = preResolveAwsCredentials(),
+#  endif
+        };
+
         /* Set up private namespaces for the build:
 
            - The PID namespace causes the build to start as PID 1.
@@ -342,7 +349,7 @@ struct ChrootLinuxDerivationBuilder : ChrootDerivationBuilder, LinuxDerivationBu
                 if (usingUserNamespace)
                     options.cloneFlags |= CLONE_NEWUSER;
 
-                pid_t child = startProcess([&]() { runChild(); }, options);
+                pid_t child = startProcess([this, args = std::move(args)]() { runChild(std::move(args)); }, options);
 
                 writeFull(sendPid.writeSide.get(), fmt("%d\n", child));
                 _exit(0);
@@ -362,9 +369,21 @@ struct ChrootLinuxDerivationBuilder : ChrootDerivationBuilder, LinuxDerivationBu
 
         userNamespaceSync.readSide = -1;
 
-        /* Close the write side to prevent runChild() from hanging
-           reading from this. */
-        Finally cleanup([&]() { userNamespaceSync.writeSide = -1; });
+        /* Make sure that we write *something* to the child in case of
+           an exception. Note that merely closing
+           `userNamespaceSync.writeSide` doesn't work in
+           multi-threaded Nix, since several child processes may have
+           inherited `writeSide` (and O_CLOEXEC doesn't help because
+           the children may not do an execve). */
+        bool userNamespaceSyncDone = false;
+        Finally cleanup([&]() {
+            try {
+                if (!userNamespaceSyncDone)
+                    writeFull(userNamespaceSync.writeSide.get(), "0\n");
+            } catch (...) {
+            }
+            userNamespaceSync.writeSide = -1;
+        });
 
         auto ss = tokenizeString<std::vector<std::string>>(readLine(sendPid.readSide.get()));
         assert(ss.size() == 1);
@@ -419,14 +438,15 @@ struct ChrootLinuxDerivationBuilder : ChrootDerivationBuilder, LinuxDerivationBu
             writeFile(*cgroup + "/cgroup.procs", fmt("%d", (pid_t) pid));
 
         /* Signal the builder that we've updated its user namespace. */
-        writeFull(userNamespaceSync.writeSide.get(), "1");
+        writeFull(userNamespaceSync.writeSide.get(), "1\n");
+        userNamespaceSyncDone = true;
     }
 
     void enterChroot() override
     {
         userNamespaceSync.writeSide = -1;
 
-        if (drainFD(userNamespaceSync.readSide.get()) != "1")
+        if (readLine(userNamespaceSync.readSide.get()) != "1")
             throw Error("user namespace initialisation failed");
 
         userNamespaceSync.readSide = -1;
@@ -492,8 +512,16 @@ struct ChrootLinuxDerivationBuilder : ChrootDerivationBuilder, LinuxDerivationBu
             createDirs(chrootRootDir + "/dev/shm");
             createDirs(chrootRootDir + "/dev/pts");
             ss.push_back("/dev/full");
-            if (store.config.systemFeatures.get().count("kvm") && pathExists("/dev/kvm"))
-                ss.push_back("/dev/kvm");
+            if (systemFeatures.count("kvm")) {
+                if (pathExists("/dev/kvm")) {
+                    ss.push_back("/dev/kvm");
+                } else {
+                    warn(
+                        "KVM is enabled in system-features but /dev/kvm is not available. "
+                        "QEMU builds may fall back to slow emulation. "
+                        "Consider removing 'kvm' from system-features in nix.conf if KVM is not supported on this system.");
+                }
+            }
             ss.push_back("/dev/null");
             ss.push_back("/dev/random");
             ss.push_back("/dev/tty");
@@ -659,7 +687,7 @@ struct ChrootLinuxDerivationBuilder : ChrootDerivationBuilder, LinuxDerivationBu
             throw SysError("setuid failed");
     }
 
-    std::variant<std::pair<BuildResult::Status, Error>, SingleDrvOutputs> unprepareBuild() override
+    SingleDrvOutputs unprepareBuild() override
     {
         sandboxMountNamespace = -1;
         sandboxUserNamespace = -1;
@@ -681,8 +709,11 @@ struct ChrootLinuxDerivationBuilder : ChrootDerivationBuilder, LinuxDerivationBu
         DerivationBuilderImpl::killSandbox(getStats);
     }
 
-    void addDependency(const StorePath & path) override
+    void addDependencyImpl(const StorePath & path) override
     {
+        if (isAllowed(path))
+            return;
+
         auto [source, target] = ChrootDerivationBuilder::addDependencyPrep(path);
 
         /* Bind-mount the path into the sandbox. This requires

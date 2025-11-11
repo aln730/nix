@@ -3,7 +3,7 @@ project(
   'cpp',
   version : files('.version'),
   default_options : [
-    'cpp_std=c++2a',
+    'cpp_std=c++23',
     # TODO(Qyriad): increase the warning level
     'warning_level=1',
     'errorlogs=true', # Please print logs for tests that fail
@@ -54,31 +54,37 @@ deps_private += gtest
 subdir('nix-meson-build-support/common')
 
 sources = files(
+  'build-result.cc',
   'common-protocol.cc',
   'content-address.cc',
   'derivation-advanced-attrs.cc',
   'derivation.cc',
   'derived-path.cc',
   'downstream-placeholder.cc',
+  'dummy-store.cc',
   'http-binary-cache-store.cc',
   'legacy-ssh-store.cc',
   'local-binary-cache-store.cc',
   'local-overlay-store.cc',
   'local-store.cc',
   'machines.cc',
+  'main.cc',
   'nar-info-disk-cache.cc',
   'nar-info.cc',
   'nix_api_store.cc',
   'outputs-spec.cc',
   'path-info.cc',
   'path.cc',
+  'realisation.cc',
   'references.cc',
   's3-binary-cache-store.cc',
+  's3-url.cc',
   'serve-protocol.cc',
   'ssh-store.cc',
   'store-reference.cc',
   'uds-remote-store.cc',
   'worker-protocol.cc',
+  'write-derivation.cc',
 )
 
 include_dirs = [ include_directories('.') ]
@@ -94,6 +100,7 @@ this_exe = executable(
   link_args : linker_export_flags + [ '-lrapidcheck' ],
   # get main from gtest
   install : true,
+  cpp_pch : do_pch ? [ 'pch/precompiled-headers.hh' ] : [],
 )
 
 test(
@@ -127,10 +134,14 @@ if get_option('benchmarks')
     include_directories : include_dirs,
     link_args : linker_export_flags,
     install : true,
-    cpp_args : [
-      '-DNIX_UNIT_TEST_DATA="' + meson.current_source_dir() + '/data"',
-    ],
+    cpp_pch : do_pch ? [ 'pch/precompiled-headers.hh' ] : [],
   )
 
-  benchmark('nix-store-benchmarks', benchmark_exe)
+  benchmark(
+    'nix-store-benchmarks',
+    benchmark_exe,
+    env : {
+      '_NIX_TEST_UNIT_DATA' : meson.current_source_dir() / 'data',
+    },
+  )
 endif

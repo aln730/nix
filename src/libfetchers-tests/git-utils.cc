@@ -173,4 +173,64 @@ TEST_F(GitUtilsTest, peel_reference)
     git_repository_free(rawRepo);
 }
 
+TEST(GitUtils, isLegalRefName)
+{
+    ASSERT_TRUE(isLegalRefName("A/b"));
+    ASSERT_TRUE(isLegalRefName("AaA/b"));
+    ASSERT_TRUE(isLegalRefName("FOO/BAR/BAZ"));
+    ASSERT_TRUE(isLegalRefName("HEAD"));
+    ASSERT_TRUE(isLegalRefName("refs/tags/1.2.3"));
+    ASSERT_TRUE(isLegalRefName("refs/heads/master"));
+    ASSERT_TRUE(isLegalRefName("foox"));
+    ASSERT_TRUE(isLegalRefName("1337"));
+    ASSERT_TRUE(isLegalRefName("foo.baz"));
+    ASSERT_TRUE(isLegalRefName("foo/bar/baz"));
+    ASSERT_TRUE(isLegalRefName("foo./bar"));
+    ASSERT_TRUE(isLegalRefName("heads/foo@bar"));
+    ASSERT_TRUE(isLegalRefName("heads/fu\303\237"));
+    ASSERT_TRUE(isLegalRefName("foo-bar-baz"));
+    ASSERT_TRUE(isLegalRefName("branch#"));
+    ASSERT_TRUE(isLegalRefName("$1"));
+    ASSERT_TRUE(isLegalRefName("foo.locke"));
+
+    ASSERT_FALSE(isLegalRefName("refs///heads/foo"));
+    ASSERT_FALSE(isLegalRefName("heads/foo/"));
+    ASSERT_FALSE(isLegalRefName("///heads/foo"));
+    ASSERT_FALSE(isLegalRefName(".foo"));
+    ASSERT_FALSE(isLegalRefName("./foo"));
+    ASSERT_FALSE(isLegalRefName("./foo/bar"));
+    ASSERT_FALSE(isLegalRefName("foo/./bar"));
+    ASSERT_FALSE(isLegalRefName("foo/bar/."));
+    ASSERT_FALSE(isLegalRefName("foo bar"));
+    ASSERT_FALSE(isLegalRefName("foo?bar"));
+    ASSERT_FALSE(isLegalRefName("foo^bar"));
+    ASSERT_FALSE(isLegalRefName("foo~bar"));
+    ASSERT_FALSE(isLegalRefName("foo:bar"));
+    ASSERT_FALSE(isLegalRefName("foo[bar"));
+    ASSERT_FALSE(isLegalRefName("foo/bar/."));
+    ASSERT_FALSE(isLegalRefName(".refs/foo"));
+    ASSERT_FALSE(isLegalRefName("refs/heads/foo."));
+    ASSERT_FALSE(isLegalRefName("heads/foo..bar"));
+    ASSERT_FALSE(isLegalRefName("heads/foo?bar"));
+    ASSERT_FALSE(isLegalRefName("heads/foo.lock"));
+    ASSERT_FALSE(isLegalRefName("heads///foo.lock"));
+    ASSERT_FALSE(isLegalRefName("foo.lock/bar"));
+    ASSERT_FALSE(isLegalRefName("foo.lock///bar"));
+    ASSERT_FALSE(isLegalRefName("heads/v@{ation"));
+    ASSERT_FALSE(isLegalRefName("heads/foo\bar"));
+
+    ASSERT_FALSE(isLegalRefName("@"));
+    ASSERT_FALSE(isLegalRefName("\37"));
+    ASSERT_FALSE(isLegalRefName("\177"));
+
+    ASSERT_FALSE(isLegalRefName("foo/*"));
+    ASSERT_FALSE(isLegalRefName("*/foo"));
+    ASSERT_FALSE(isLegalRefName("foo/*/bar"));
+    ASSERT_FALSE(isLegalRefName("*"));
+    ASSERT_FALSE(isLegalRefName("foo/*/*"));
+    ASSERT_FALSE(isLegalRefName("*/foo/*"));
+    ASSERT_FALSE(isLegalRefName("/foo"));
+    ASSERT_FALSE(isLegalRefName(""));
+}
+
 } // namespace nix

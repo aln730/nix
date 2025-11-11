@@ -4,6 +4,7 @@ include_dirs = [ include_directories('../..') ]
 
 headers = files(
   'abstract-setting-to-json.hh',
+  'alignment.hh',
   'ansicolor.hh',
   'archive.hh',
   'args.hh',
@@ -42,10 +43,12 @@ headers = files(
   'hash.hh',
   'hilite.hh',
   'json-impls.hh',
+  'json-non-null.hh',
   'json-utils.hh',
   'logging.hh',
   'lru-cache.hh',
   'memory-source-accessor.hh',
+  'mounted-source-accessor.hh',
   'muxable-pipe.hh',
   'os-string.hh',
   'pool.hh',

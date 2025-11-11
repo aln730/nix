@@ -3,7 +3,7 @@ project(
   'cpp',
   version : files('.version'),
   default_options : [
-    'cpp_std=c++2a',
+    'cpp_std=c++23',
     # TODO(Qyriad): increase the warning level
     'warning_level=1',
     'errorlogs=true', # Please print logs for tests that fail
@@ -44,6 +44,8 @@ config_priv_h = configure_file(
 subdir('nix-meson-build-support/common')
 
 sources = files(
+  'alignment.cc',
+  'archive.cc',
   'args.cc',
   'base-n.cc',
   'canon-path.cc',
@@ -63,6 +65,7 @@ sources = files(
   'lru-cache.cc',
   'monitorfdhup.cc',
   'nix_api_util.cc',
+  'nix_api_util_internal.cc',
   'pool.cc',
   'position.cc',
   'processes.cc',
@@ -71,6 +74,7 @@ sources = files(
   'strings.cc',
   'suggestions.cc',
   'terminal.cc',
+  'topo-sort.cc',
   'url.cc',
   'util.cc',
   'xml-writer.cc',
@@ -89,6 +93,7 @@ this_exe = executable(
   link_args : linker_export_flags + [ '-lrapidcheck' ],
   # get main from gtest
   install : true,
+  cpp_pch : do_pch ? [ 'pch/precompiled-headers.hh' ] : [],
 )
 
 test(

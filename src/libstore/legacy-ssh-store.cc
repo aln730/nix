@@ -13,6 +13,7 @@
 #include "nix/store/derivations.hh"
 #include "nix/util/callback.hh"
 #include "nix/store/store-registration.hh"
+#include "nix/store/globals.hh"
 
 namespace nix {
 
@@ -88,17 +89,21 @@ ref<LegacySSHStore::Connection> LegacySSHStore::openConnection()
     return conn;
 };
 
-std::string LegacySSHStore::getUri()
+StoreReference LegacySSHStoreConfig::getReference() const
 {
-    return *Config::uriSchemes().begin() + "://" + config->authority.to_string();
+    return {
+        .variant =
+            StoreReference::Specified{
+                .scheme = *uriSchemes().begin(),
+                .authority = authority.to_string(),
+            },
+        .params = getQueryParams(),
+    };
 }
 
 std::map<StorePath, UnkeyedValidPathInfo> LegacySSHStore::queryPathInfosUncached(const StorePathSet & paths)
 {
     auto conn(connections->get());
-
-    /* No longer support missing NAR hash */
-    assert(GET_PROTOCOL_MINOR(conn->remoteVersion) >= 4);
 
     debug(
         "querying remote host '%s' for info on '%s'",
@@ -144,40 +149,21 @@ void LegacySSHStore::addToStore(const ValidPathInfo & info, Source & source, Rep
 
     auto conn(connections->get());
 
-    if (GET_PROTOCOL_MINOR(conn->remoteVersion) >= 5) {
-
-        conn->to << ServeProto::Command::AddToStoreNar << printStorePath(info.path)
-                 << (info.deriver ? printStorePath(*info.deriver) : "")
-                 << info.narHash.to_string(HashFormat::Base16, false);
-        ServeProto::write(*this, *conn, info.references);
-        conn->to << info.registrationTime << info.narSize << info.ultimate << info.sigs
-                 << renderContentAddress(info.ca);
-        try {
-            copyNAR(source, conn->to);
-        } catch (...) {
-            conn->good = false;
-            throw;
-        }
-        conn->to.flush();
-
-        if (readInt(conn->from) != 1)
-            throw Error(
-                "failed to add path '%s' to remote host '%s'", printStorePath(info.path), config->authority.host);
-
-    } else {
-
-        conn->importPaths(*this, [&](Sink & sink) {
-            try {
-                copyNAR(source, sink);
-            } catch (...) {
-                conn->good = false;
-                throw;
-            }
-            sink << exportMagic << printStorePath(info.path);
-            ServeProto::write(*this, *conn, info.references);
-            sink << (info.deriver ? printStorePath(*info.deriver) : "") << 0 << 0;
-        });
+    conn->to << ServeProto::Command::AddToStoreNar << printStorePath(info.path)
+             << (info.deriver ? printStorePath(*info.deriver) : "")
+             << info.narHash.to_string(HashFormat::Base16, false);
+    ServeProto::write(*this, *conn, info.references);
+    conn->to << info.registrationTime << info.narSize << info.ultimate << info.sigs << renderContentAddress(info.ca);
+    try {
+        copyNAR(source, conn->to);
+    } catch (...) {
+        conn->good = false;
+        throw;
     }
+    conn->to.flush();
+
+    if (readInt(conn->from) != 1)
+        throw Error("failed to add path '%s' to remote host '%s'", printStorePath(info.path), config->authority.host);
 }
 
 void LegacySSHStore::narFromPath(const StorePath & path, Sink & sink)
@@ -255,12 +241,13 @@ void LegacySSHStore::buildPaths(
 
     conn->to.flush();
 
-    BuildResult result;
-    result.status = (BuildResult::Status) readInt(conn->from);
-
-    if (!result.success()) {
-        conn->from >> result.errorMsg;
-        throw Error(result.status, result.errorMsg);
+    auto status = readInt(conn->from);
+    if (!BuildResult::Success::statusIs(status)) {
+        BuildResult::Failure failure{
+            .status = (BuildResult::Failure::Status) status,
+        };
+        conn->from >> failure.errorMsg;
+        throw Error(failure.status, std::move(failure.errorMsg));
     }
 }
 
@@ -292,22 +279,6 @@ StorePathSet LegacySSHStore::queryValidPaths(const StorePathSet & paths, bool lo
 {
     auto conn(connections->get());
     return conn->queryValidPaths(*this, lock, paths, maybeSubstitute);
-}
-
-void LegacySSHStore::addMultipleToStoreLegacy(Store & srcStore, const StorePathSet & paths)
-{
-    auto conn(connections->get());
-    conn->to << ServeProto::Command::ImportPaths;
-    try {
-        srcStore.exportPaths(paths, conn->to);
-    } catch (...) {
-        conn->good = false;
-        throw;
-    }
-    conn->to.flush();
-
-    if (readInt(conn->from) != 1)
-        throw Error("remote machine failed to import closure");
 }
 
 void LegacySSHStore::connect()
